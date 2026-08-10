@@ -194,9 +194,10 @@
     async function ensurePeerConnection() {
       if (pc) return;
 
-      // Use STUN + free TURN server for NAT traversal
-      // STUN: finds public IP. TURN: relays media if direct connection fails
+      // Use STUN + TURN for NAT traversal.
+      // TURN over TLS/TCP is important on restrictive mobile/corporate networks.
       pc = new RTCPeerConnection({
+        iceTransportPolicy: 'all',
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
@@ -206,7 +207,12 @@
             credential: 'openrelayproject',
           },
           {
-            urls: 'turn:openrelay.metered.ca:443',
+            urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+            username: 'openrelayproject',
+            credential: 'openrelayproject',
+          },
+          {
+            urls: 'turns:openrelay.metered.ca:443?transport=tcp',
             username: 'openrelayproject',
             credential: 'openrelayproject',
           },
@@ -227,6 +233,9 @@
       pc.ontrack = (event) => {
         log(`Remote track received: ${event.track.kind}`);
         remoteVideo.srcObject = event.streams[0];
+        remoteVideo.play().catch((err) => {
+          log(`Remote video play blocked: ${err.message}`);
+        });
       };
 
       // Log connection state changes (connecting, connected, disconnected, etc.)
@@ -236,6 +245,30 @@
 
       pc.oniceconnectionstatechange = () => {
         log(`ICE connection state: ${pc.iceConnectionState}`);
+      };
+
+      pc.onicecandidateerror = (event) => {
+        log(`ICE candidate error: ${event.errorCode} ${event.errorText || ''}`.trim());
+      };
+
+      // Log selected ICE pair details so we can verify host/srflx/relay usage.
+      pc.onicegatheringstatechange = async () => {
+        if (pc.iceGatheringState !== 'complete') return;
+        try {
+          const stats = await pc.getStats();
+          for (const report of stats.values()) {
+            if (report.type === 'candidate-pair' && report.nominated && report.state === 'succeeded') {
+              const local = stats.get(report.localCandidateId);
+              const remote = stats.get(report.remoteCandidateId);
+              if (local && remote) {
+                log(`Selected pair: ${local.candidateType} -> ${remote.candidateType}`);
+              }
+              break;
+            }
+          }
+        } catch (err) {
+          log(`Stats error: ${err.message}`);
+        }
       };
 
       await ensureMedia();
