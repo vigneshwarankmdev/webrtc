@@ -1,26 +1,9 @@
 <!doctype html>
-<!--
-  index.html — WebRTC Demo Client
-
-  How it works:
-  1. On load, a WebSocket connection is opened to the signaling server.
-  2. The user enters a Room ID and clicks "Join Room" — a 'join' message
-     is sent over WebSocket so the server groups two peers together.
-  3. The first peer clicks "Start Call":
-       a. getUserMedia() captures the local camera/microphone.
-       b. An RTCPeerConnection is created with a public STUN server.
-       c. An SDP offer is created and forwarded to the other peer via
-          the signaling server (type: 'signal').
-  4. The second peer receives the offer, creates an answer, and sends it back.
-  5. Both peers exchange ICE candidates through the signaling server.
-  6. Once ICE negotiation succeeds, media streams flow directly between
-     the two browsers — the signaling server is no longer involved.
--->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Simple WebRTC Demo</title>
+  <title>Realtime Text Sync (Free)</title>
   <style>
     :root {
       --bg: #f4f7fb;
@@ -30,6 +13,8 @@
       --brand: #1363df;
       --brand-2: #0f4eb0;
       --border: #d8e0ee;
+      --ok: #1f8f52;
+      --warn: #a86a00;
     }
 
     * { box-sizing: border-box; }
@@ -46,7 +31,7 @@
     }
 
     .card {
-      width: min(920px, 100%);
+      width: min(980px, 100%);
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 16px;
@@ -59,7 +44,10 @@
       font-size: 1.35rem;
     }
 
-    .muted { color: var(--muted); margin-top: 0; }
+    .muted {
+      color: var(--muted);
+      margin-top: 0;
+    }
 
     .row {
       display: flex;
@@ -68,7 +56,9 @@
       margin: 12px 0 16px;
     }
 
-    input, button {
+    input,
+    button,
+    textarea {
       border-radius: 10px;
       border: 1px solid var(--border);
       padding: 10px 12px;
@@ -87,20 +77,40 @@
       cursor: pointer;
     }
 
-    button:hover { background: var(--brand-2); }
+    button:hover {
+      background: var(--brand-2);
+    }
 
-    .videos {
+    .status-line {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .status-line strong {
+      color: var(--ok);
+    }
+
+    .status-line .warn {
+      color: var(--warn);
+    }
+
+    .texts {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: 1fr 1fr;
       gap: 12px;
     }
 
-    video {
+    textarea {
       width: 100%;
-      background: #101421;
-      border-radius: 12px;
-      border: 1px solid #2a3550;
-      aspect-ratio: 16 / 9;
+      min-height: 220px;
+      resize: vertical;
+      font-family: Consolas, 'Courier New', monospace;
+      line-height: 1.4;
+    }
+
+    textarea[readonly] {
+      background: #f8fafc;
     }
 
     pre {
@@ -113,27 +123,38 @@
       padding: 10px;
       font-size: 0.85rem;
     }
+
+    @media (max-width: 780px) {
+      .texts {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body>
   <main class="card">
-    <h1>Simple WebRTC Signaling Demo</h1>
-    <p class="muted">Open this page in two tabs, join the same room, and click Start in one tab.</p>
+    <h1>Realtime Text Sync (Free WebRTC + Fallback)</h1>
+    <p class="muted">Open on two devices, join the same room, and start typing. Text syncs instantly.</p>
 
     <div class="row">
       <input id="roomId" value="demo-room" placeholder="Room ID" />
       <button id="joinBtn">Join Room</button>
-      <button id="startBtn">Start Call</button>
     </div>
 
-    <div class="videos">
+    <p class="status-line">
+      Signaling: <strong id="signalStatus">connecting</strong>
+      | Peer: <strong id="peerStatus" class="warn">disconnected</strong>
+      | Transport: <strong id="transportStatus" class="warn">ws-relay</strong>
+    </p>
+
+    <div class="texts">
       <div>
-        <p class="muted">Local</p>
-        <video id="localVideo" autoplay playsinline muted></video>
+        <p class="muted">Your text</p>
+        <textarea id="myText" placeholder="Type here..." disabled></textarea>
       </div>
       <div>
-        <p class="muted">Remote</p>
-        <video id="remoteVideo" autoplay playsinline></video>
+        <p class="muted">Remote mirror</p>
+        <textarea id="remoteText" readonly placeholder="Remote typing appears here"></textarea>
       </div>
     </div>
 
@@ -141,257 +162,298 @@
   </main>
 
   <script>
-    // --- DOM references ---
     const logEl = document.getElementById('log');
     const roomIdEl = document.getElementById('roomId');
-    const localVideo = document.getElementById('localVideo');
-    const remoteVideo = document.getElementById('remoteVideo');
+    const myTextEl = document.getElementById('myText');
+    const remoteTextEl = document.getElementById('remoteText');
     const joinBtn = document.getElementById('joinBtn');
-    const startBtn = document.getElementById('startBtn');
+    const signalStatusEl = document.getElementById('signalStatus');
+    const peerStatusEl = document.getElementById('peerStatus');
+    const transportStatusEl = document.getElementById('transportStatus');
 
-    // Open WebSocket to the signaling server (same host, wss on HTTPS)
     const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${wsProtocol}//${location.host}`);
 
-    let pc;           // RTCPeerConnection instance
-    let localStream;  // MediaStream from getUserMedia
-    let remoteStream; // MediaStream rendered in the remote <video>
-    let joined = false;      // True once the server confirms room entry
-    let makingOffer = false; // Guards against simultaneous offer creation
-    let iceCandidateBuffer = []; // Buffer ICE candidates until remote description is set
+    const fallbackRtcConfig = {
+      iceTransportPolicy: 'all',
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ],
+    };
 
-    /** Append a timestamped message to the on-screen log. */
+    let pc;
+    let dc;
+    let joined = false;
+    let isMakingOffer = false;
+    let ignoreOffer = false;
+    let isPolite = true;
+    let iceCandidateBuffer = [];
+    let rtcConfigPromise;
+    let sendTimer;
+    let roomId = '';
+
     function log(msg) {
       const time = new Date().toLocaleTimeString();
       logEl.textContent += `[${time}] ${msg}\n`;
       logEl.scrollTop = logEl.scrollHeight;
     }
 
-    /** Send a JSON message to the signaling server over WebSocket. */
-    function send(payload) {
+    function sendWs(payload) {
       ws.send(JSON.stringify(payload));
     }
 
-    /**
-     * Request camera + microphone access and attach the stream to
-     * the local <video> element. Only runs once per page load.
-     */
-    async function ensureMedia() {
-      if (!localStream) {
-        // Check if mediaDevices is available (requires HTTPS or localhost)
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          throw new Error('Camera/microphone access not available. Ensure you are using HTTPS or localhost.');
-        }
-        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-        localVideo.srcObject = localStream;
-      }
+    function setSignalStatus(value, warn = false) {
+      signalStatusEl.textContent = value;
+      signalStatusEl.className = warn ? 'warn' : '';
     }
 
-    /**
-     * Create the RTCPeerConnection (if not already created) and wire up
-     * its event handlers. Also calls ensureMedia() so local tracks are
-     * added before any offer/answer is negotiated.
-     */
+    function setPeerStatus(value, warn = false) {
+      peerStatusEl.textContent = value;
+      peerStatusEl.className = warn ? 'warn' : '';
+    }
+
+    function setTransportStatus(value, warn = false) {
+      transportStatusEl.textContent = value;
+      transportStatusEl.className = warn ? 'warn' : '';
+    }
+
+    async function getRtcConfig() {
+      if (rtcConfigPromise) return rtcConfigPromise;
+      rtcConfigPromise = (async () => {
+        try {
+          const response = await fetch('/ice-config', { cache: 'no-store' });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const config = await response.json();
+          if (!config || !Array.isArray(config.iceServers) || config.iceServers.length === 0) {
+            throw new Error('invalid payload');
+          }
+          log(`Loaded ICE config (${config.iceServers.length} servers)`);
+          return {
+            iceTransportPolicy: config.iceTransportPolicy === 'relay' ? 'relay' : 'all',
+            iceServers: config.iceServers,
+          };
+        } catch (err) {
+          log(`Using fallback ICE config: ${err.message}`);
+          return fallbackRtcConfig;
+        }
+      })();
+
+      return rtcConfigPromise;
+    }
+
+    function getActiveTransport() {
+      return dc && dc.readyState === 'open' ? 'webrtc-datachannel' : 'ws-relay';
+    }
+
+    function updateTransportBadge() {
+      const active = getActiveTransport();
+      setTransportStatus(active, active !== 'webrtc-datachannel');
+    }
+
+    function onDataChannelOpen() {
+      log('DataChannel open. Using peer-to-peer text transport.');
+      setPeerStatus('connected');
+      updateTransportBadge();
+      sendTextSync();
+    }
+
+    function attachDataChannel(channel) {
+      dc = channel;
+      dc.onopen = onDataChannelOpen;
+      dc.onclose = () => {
+        log('DataChannel closed. Falling back to ws-relay.');
+        updateTransportBadge();
+      };
+      dc.onerror = (event) => {
+        log(`DataChannel error: ${event.type}`);
+      };
+      dc.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'text-sync') {
+            remoteTextEl.value = String(message.text || '');
+          }
+        } catch {
+          // Ignore malformed data-channel payloads.
+        }
+      };
+    }
+
     async function ensurePeerConnection() {
       if (pc) return;
 
-      // Use STUN + TURN for NAT traversal.
-      // TURN over TLS/TCP is important on restrictive mobile/corporate networks.
-      pc = new RTCPeerConnection({
-        iceTransportPolicy: 'all',
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          {
-            urls: 'turn:openrelay.metered.ca:80',
-            username: 'openrelayproject',
-            credential: 'openrelayproject',
-          },
-          {
-            urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-            username: 'openrelayproject',
-            credential: 'openrelayproject',
-          },
-          {
-            urls: 'turns:openrelay.metered.ca:443?transport=tcp',
-            username: 'openrelayproject',
-            credential: 'openrelayproject',
-          },
-        ],
-      });
+      const rtcConfig = await getRtcConfig();
+      pc = new RTCPeerConnection(rtcConfig);
 
-      // Log all ICE candidates discovered
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          log(`ICE candidate: ${event.candidate.candidate.split(' ')[4]} (${event.candidate.type})`);
-          send({ type: 'signal', data: { candidate: event.candidate } });
-        } else {
-          log('ICE gathering complete.');
+          sendWs({ type: 'signal', data: { candidate: event.candidate } });
         }
-      };
-
-      // Build one persistent remote stream and add incoming tracks to it.
-      // This avoids replacing srcObject multiple times (audio/video arrive separately),
-      // which can interrupt play() and keep video blank on some devices.
-      pc.ontrack = (event) => {
-        log(`Remote track received: ${event.track.kind}`);
-
-        if (!remoteStream) {
-          remoteStream = new MediaStream();
-          remoteVideo.srcObject = remoteStream;
-        }
-
-        const exists = remoteStream.getTracks().some((t) => t.id === event.track.id);
-        if (!exists) {
-          remoteStream.addTrack(event.track);
-        }
-
-        // Try to start rendering without surfacing harmless interruption errors.
-        remoteVideo.play().catch((err) => {
-          if (!String(err.message || '').includes('interrupted by a new load request')) {
-            log(`Remote video play blocked: ${err.message}`);
-          }
-        });
-      };
-
-      // Log connection state changes (connecting, connected, disconnected, etc.)
-      pc.onconnectionstatechange = () => {
-        log(`Connection state: ${pc.connectionState}`);
       };
 
       pc.oniceconnectionstatechange = () => {
-        log(`ICE connection state: ${pc.iceConnectionState}`);
-      };
-
-      pc.onicecandidateerror = (event) => {
-        log(`ICE candidate error: ${event.errorCode} ${event.errorText || ''}`.trim());
-      };
-
-      // Log selected ICE pair details so we can verify host/srflx/relay usage.
-      pc.onicegatheringstatechange = async () => {
-        if (pc.iceGatheringState !== 'complete') return;
-        try {
-          const stats = await pc.getStats();
-          for (const report of stats.values()) {
-            if (report.type === 'candidate-pair' && report.nominated && report.state === 'succeeded') {
-              const local = stats.get(report.localCandidateId);
-              const remote = stats.get(report.remoteCandidateId);
-              if (local && remote) {
-                log(`Selected pair: ${local.candidateType} -> ${remote.candidateType}`);
-              }
-              break;
-            }
-          }
-        } catch (err) {
-          log(`Stats error: ${err.message}`);
+        const state = pc.iceConnectionState;
+        log(`ICE: ${state}`);
+        if (state === 'connected' || state === 'completed') {
+          setPeerStatus('connected');
+        }
+        if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+          setPeerStatus(state, true);
+          updateTransportBadge();
         }
       };
 
-      await ensureMedia();
-      // Add local audio/video tracks so they are included in the SDP offer
-      for (const track of localStream.getTracks()) {
-        pc.addTrack(track, localStream);
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        log(`PC: ${state}`);
+        if (state === 'failed') {
+          updateTransportBadge();
+        }
+      };
+
+      pc.ondatachannel = (event) => {
+        log('DataChannel received from peer.');
+        attachDataChannel(event.channel);
+      };
+
+      // Proactively create a channel; if both sides create one, both still work.
+      if (!dc) {
+        attachDataChannel(pc.createDataChannel('text-sync'));
       }
     }
 
-    /**
-     * Initiates a call by creating an SDP offer and sending it to the
-     * remote peer through the signaling server.
-     * Only the peer that clicks "Start Call" sends the offer.
-     */
-    async function startCall() {
-      if (!joined) {
-        log('Join a room first.');
+    async function makeOffer() {
+      if (!joined) return;
+      await ensurePeerConnection();
+      try {
+        isMakingOffer = true;
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sendWs({ type: 'signal', data: { description: pc.localDescription } });
+        log('Offer sent.');
+      } finally {
+        isMakingOffer = false;
+      }
+    }
+
+    async function handleDescription(description) {
+      await ensurePeerConnection();
+
+      const offerCollision = description.type === 'offer' && (isMakingOffer || pc.signalingState !== 'stable');
+      ignoreOffer = !isPolite && offerCollision;
+      if (ignoreOffer) {
         return;
       }
 
-      await ensurePeerConnection();
-      makingOffer = true;
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer); // Triggers ICE candidate gathering
-      send({ type: 'signal', data: { description: pc.localDescription } });
-      makingOffer = false;
-      log('Offer sent.');
+      await pc.setRemoteDescription(description);
+
+      for (const candidate of iceCandidateBuffer) {
+        try {
+          await pc.addIceCandidate(candidate);
+        } catch (err) {
+          log(`Buffered ICE error: ${err.message}`);
+        }
+      }
+      iceCandidateBuffer = [];
+
+      if (description.type === 'offer') {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendWs({ type: 'signal', data: { description: pc.localDescription } });
+        log('Answer sent.');
+      }
     }
 
-    ws.onopen = () => log('Connected to signaling server.');
+    async function handleCandidate(candidate) {
+      if (!pc || !pc.remoteDescription) {
+        iceCandidateBuffer.push(candidate);
+        return;
+      }
 
-    // Handle all incoming messages from the signaling server
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch (err) {
+        log(`ICE add error: ${err.message}`);
+      }
+    }
+
+    function sendTextSync() {
+      if (!joined) return;
+
+      const payload = {
+        type: 'text-sync',
+        text: myTextEl.value,
+      };
+
+      if (dc && dc.readyState === 'open') {
+        dc.send(JSON.stringify(payload));
+      } else {
+        sendWs(payload);
+      }
+
+      updateTransportBadge();
+    }
+
+    function scheduleSend() {
+      clearTimeout(sendTimer);
+      sendTimer = setTimeout(sendTextSync, 40);
+    }
+
+    ws.onopen = () => {
+      setSignalStatus('connected');
+      log('Connected to signaling server.');
+    };
+
+    ws.onclose = () => {
+      setSignalStatus('disconnected', true);
+      log('Disconnected from signaling server.');
+    };
+
     ws.onmessage = async (event) => {
       const message = JSON.parse(event.data);
 
-      // Server confirmed room entry
       if (message.type === 'joined') {
         joined = true;
-        log(`Joined room: ${message.roomId} (peers: ${message.peerCount})`);
+        roomId = message.roomId;
+        myTextEl.disabled = false;
+        setPeerStatus(message.peerCount > 1 ? 'peer-present' : 'waiting', message.peerCount <= 1);
+        log(`Joined room: ${roomId} (peers: ${message.peerCount})`);
+
+        if (message.peerCount === 2) {
+          await makeOffer();
+        }
         return;
       }
 
-      // The other browser tab has joined the same room
       if (message.type === 'peer-joined') {
+        setPeerStatus('peer-present');
         log('Peer joined room.');
+        await makeOffer();
         return;
       }
 
-      // The other peer disconnected — clear the remote video
       if (message.type === 'peer-left') {
+        setPeerStatus('waiting', true);
+        setTransportStatus('ws-relay', true);
+        remoteTextEl.value = '';
         log('Peer left room.');
-        remoteVideo.srcObject = null;
-        remoteStream = null;
         return;
       }
 
-      // Signaling message: either an SDP description or an ICE candidate
       if (message.type === 'signal') {
         const { description, candidate } = message.data || {};
-        await ensurePeerConnection();
-
         if (description) {
-          // Offer collision: both peers tried to send an offer simultaneously.
-          // The 'polite' peer (always true here) rolls back and accepts the
-          // incoming offer; the 'impolite' peer would ignore it.
-          const offerCollision = description.type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
-          const polite = true;
-          if (offerCollision && !polite) {
-            return;
-          }
-
-          await pc.setRemoteDescription(description);
-          
-          // Flush any buffered ICE candidates now that remote description is set
-          for (const bufferedCandidate of iceCandidateBuffer) {
-            try {
-              await pc.addIceCandidate(bufferedCandidate);
-            } catch (err) {
-              log(`Buffered ICE error: ${err.message}`);
-            }
-          }
-          iceCandidateBuffer = [];
-          
-          // If the incoming description is an offer, create and send an answer
-          if (description.type === 'offer') {
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            send({ type: 'signal', data: { description: pc.localDescription } });
-            log('Answer sent.');
-          }
-          return;
+          await handleDescription(description);
         }
-
-        // Add the received ICE candidate to the peer connection
-        // If remote description isn't set yet, buffer the candidate
         if (candidate) {
-          if (!pc.remoteDescription) {
-            iceCandidateBuffer.push(candidate);
-            log(`ICE candidate buffered (waiting for remote description)`);
-            return;
-          }
-          try {
-            await pc.addIceCandidate(candidate);
-          } catch (err) {
-            log(`ICE error: ${err.message}`);
-          }
+          await handleCandidate(candidate);
         }
+        return;
+      }
+
+      if (message.type === 'text-sync') {
+        remoteTextEl.value = String(message.text || '');
         return;
       }
 
@@ -400,20 +462,19 @@
       }
     };
 
-    // Send a 'join' message to the server with the chosen room ID
     joinBtn.addEventListener('click', () => {
-      const roomId = roomIdEl.value.trim();
-      if (!roomId) {
+      const nextRoom = roomIdEl.value.trim();
+      if (!nextRoom) {
         log('Room ID cannot be empty.');
         return;
       }
-      send({ type: 'join', roomId });
+
+      sendWs({ type: 'join', roomId: nextRoom });
+      setPeerStatus('joining...', true);
     });
 
-    // Kick off the call from this peer (creates and sends the SDP offer)
-    startBtn.addEventListener('click', () => {
-      startCall().catch((err) => log(`Start call failed: ${err.message}`));
-    });
+    myTextEl.addEventListener('input', scheduleSend);
+    updateTransportBadge();
   </script>
 </body>
 </html>
