@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Realtime Text Sync (Free)</title>
+  <title>Realtime Text Sync (WebRTC Only)</title>
   <style>
     :root {
       --bg: #f4f7fb;
@@ -133,7 +133,7 @@
 </head>
 <body>
   <main class="card">
-    <h1>Realtime Text Sync (Free WebRTC + Fallback)</h1>
+    <h1>Realtime Text Sync (WebRTC Only)</h1>
     <p class="muted">Open on two devices, join the same room, and start typing. Text syncs instantly.</p>
 
     <div class="row">
@@ -144,7 +144,7 @@
     <p class="status-line">
       Signaling: <strong id="signalStatus">connecting</strong>
       | Peer: <strong id="peerStatus" class="warn">disconnected</strong>
-      | Transport: <strong id="transportStatus" class="warn">ws-relay</strong>
+      | Transport: <strong id="transportStatus" class="warn">not-ready</strong>
     </p>
 
     <div class="texts">
@@ -243,7 +243,7 @@
     }
 
     function getActiveTransport() {
-      return dc && dc.readyState === 'open' ? 'webrtc-datachannel' : 'ws-relay';
+      return dc && dc.readyState === 'open' ? 'webrtc-datachannel' : 'not-ready';
     }
 
     function updateTransportBadge() {
@@ -254,6 +254,7 @@
     function onDataChannelOpen() {
       log('DataChannel open. Using peer-to-peer text transport.');
       setPeerStatus('connected');
+      myTextEl.disabled = false;
       updateTransportBadge();
       sendTextSync();
     }
@@ -262,7 +263,8 @@
       dc = channel;
       dc.onopen = onDataChannelOpen;
       dc.onclose = () => {
-        log('DataChannel closed. Falling back to ws-relay.');
+        log('DataChannel closed. WebRTC text sync unavailable.');
+        myTextEl.disabled = true;
         updateTransportBadge();
       };
       dc.onerror = (event) => {
@@ -380,17 +382,16 @@
 
     function sendTextSync() {
       if (!joined) return;
+      if (!dc || dc.readyState !== 'open') {
+        return;
+      }
 
       const payload = {
         type: 'text-sync',
         text: myTextEl.value,
       };
 
-      if (dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify(payload));
-      } else {
-        sendWs(payload);
-      }
+      dc.send(JSON.stringify(payload));
 
       updateTransportBadge();
     }
@@ -407,6 +408,7 @@
 
     ws.onclose = () => {
       setSignalStatus('disconnected', true);
+      myTextEl.disabled = true;
       log('Disconnected from signaling server.');
     };
 
@@ -416,7 +418,7 @@
       if (message.type === 'joined') {
         joined = true;
         roomId = message.roomId;
-        myTextEl.disabled = false;
+        myTextEl.disabled = true;
         setPeerStatus(message.peerCount > 1 ? 'peer-present' : 'waiting', message.peerCount <= 1);
         log(`Joined room: ${roomId} (peers: ${message.peerCount})`);
 
@@ -435,7 +437,8 @@
 
       if (message.type === 'peer-left') {
         setPeerStatus('waiting', true);
-        setTransportStatus('ws-relay', true);
+        setTransportStatus('not-ready', true);
+        myTextEl.disabled = true;
         remoteTextEl.value = '';
         log('Peer left room.');
         return;
@@ -449,11 +452,6 @@
         if (candidate) {
           await handleCandidate(candidate);
         }
-        return;
-      }
-
-      if (message.type === 'text-sync') {
-        remoteTextEl.value = String(message.text || '');
         return;
       }
 

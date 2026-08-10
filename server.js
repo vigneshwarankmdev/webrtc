@@ -164,16 +164,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // WebSocket relay fallback for realtime text when P2P is unavailable.
-    if (message.type === 'text-sync') {
-      broadcastToRoom(room, ws, {
-        type: 'text-sync',
-        text: String(message.text || ''),
-        source: 'ws-relay',
-      });
-      return;
-    }
-
     send(ws, { type: 'error', message: 'Unknown message type' });
   });
 
