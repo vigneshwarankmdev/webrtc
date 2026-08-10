@@ -157,6 +157,7 @@
     let localStream;  // MediaStream from getUserMedia
     let joined = false;      // True once the server confirms room entry
     let makingOffer = false; // Guards against simultaneous offer creation
+    let iceCandidateBuffer = []; // Buffer ICE candidates until remote description is set
 
     /** Append a timestamped message to the on-screen log. */
     function log(msg) {
@@ -284,6 +285,17 @@
           }
 
           await pc.setRemoteDescription(description);
+          
+          // Flush any buffered ICE candidates now that remote description is set
+          for (const bufferedCandidate of iceCandidateBuffer) {
+            try {
+              await pc.addIceCandidate(bufferedCandidate);
+            } catch (err) {
+              log(`Buffered ICE error: ${err.message}`);
+            }
+          }
+          iceCandidateBuffer = [];
+          
           // If the incoming description is an offer, create and send an answer
           if (description.type === 'offer') {
             const answer = await pc.createAnswer();
@@ -295,7 +307,13 @@
         }
 
         // Add the received ICE candidate to the peer connection
+        // If remote description isn't set yet, buffer the candidate
         if (candidate) {
+          if (!pc.remoteDescription) {
+            iceCandidateBuffer.push(candidate);
+            log(`ICE candidate buffered (waiting for remote description)`);
+            return;
+          }
           try {
             await pc.addIceCandidate(candidate);
           } catch (err) {
