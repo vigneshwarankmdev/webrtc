@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simple WebRTC Demo</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --text: #202330;
+      --muted: #5f6578;
+      --brand: #1363df;
+      --brand-2: #0f4eb0;
+      --border: #d8e0ee;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif;
+      background: radial-gradient(circle at top right, #e8f1ff, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .card {
+      width: min(920px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 14px 34px rgba(21, 44, 88, 0.1);
+      padding: 20px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 1.35rem;
+    }
+
+    .muted { color: var(--muted); margin-top: 0; }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 12px 0 16px;
+    }
+
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      font-size: 0.95rem;
+    }
+
+    input {
+      flex: 1;
+      min-width: 180px;
+    }
+
+    button {
+      background: var(--brand);
+      color: #fff;
+      border-color: var(--brand);
+      cursor: pointer;
+    }
+
+    button:hover { background: var(--brand-2); }
+
+    .videos {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+    }
+
+    video {
+      width: 100%;
+      background: #101421;
+      border-radius: 12px;
+      border: 1px solid #2a3550;
+      aspect-ratio: 16 / 9;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      max-height: 180px;
+      overflow: auto;
+      background: #0f1424;
+      color: #9bd0ff;
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Simple WebRTC Signaling Demo</h1>
+    <p class="muted">Open this page in two tabs, join the same room, and click Start in one tab.</p>
+
+    <div class="row">
+      <input id="roomId" value="demo-room" placeholder="Room ID" />
+      <button id="joinBtn">Join Room</button>
+      <button id="startBtn">Start Call</button>
+    </div>
+
+    <div class="videos">
+      <div>
+        <p class="muted">Local</p>
+        <video id="localVideo" autoplay playsinline muted></video>
+      </div>
+      <div>
+        <p class="muted">Remote</p>
+        <video id="remoteVideo" autoplay playsinline></video>
+      </div>
+    </div>
+
+    <pre id="log"></pre>
+  </main>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const roomIdEl = document.getElementById('roomId');
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const joinBtn = document.getElementById('joinBtn');
+    const startBtn = document.getElementById('startBtn');
+
+    const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${wsProtocol}//${location.host}`);
+
+    let pc;
+    let localStream;
+    let joined = false;
+    let makingOffer = false;
+
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(payload) {
+      ws.send(JSON.stringify(payload));
+    }
+
+    async function ensureMedia() {
+      if (!localStream) {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        localVideo.srcObject = localStream;
+      }
+    }
+
+    async function ensurePeerConnection() {
+      if (pc) return;
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          send({ type: 'signal', data: { candidate: event.candidate } });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        remoteVideo.srcObject = event.streams[0];
+      };
+
+      pc.onconnectionstatechange = () => {
+        log(`Connection state: ${pc.connectionState}`);
+      };
+
+      await ensureMedia();
+      for (const track of localStream.getTracks()) {
+        pc.addTrack(track, localStream);
+      }
+    }
+
+    async function startCall() {
+      if (!joined) {
+        log('Join a room first.');
+        return;
+      }
+
+      await ensurePeerConnection();
+      makingOffer = true;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      send({ type: 'signal', data: { description: pc.localDescription } });
+      makingOffer = false;
+      log('Offer sent.');
+    }
+
+    ws.onopen = () => log('Connected to signaling server.');
+
+    ws.onmessage = async (event) => {
+      const message = JSON.parse(event.data);
+
+      if (message.type === 'joined') {
+        joined = true;
+        log(`Joined room: ${message.roomId} (peers: ${message.peerCount})`);
+        return;
+      }
+
+      if (message.type === 'peer-joined') {
+        log('Peer joined room.');
+        return;
+      }
+
+      if (message.type === 'peer-left') {
+        log('Peer left room.');
+        remoteVideo.srcObject = null;
+        return;
+      }
+
+      if (message.type === 'signal') {
+        const { description, candidate } = message.data || {};
+        await ensurePeerConnection();
+
+        if (description) {
+          const offerCollision = description.type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
+          const polite = true;
+          if (offerCollision && !polite) {
+            return;
+          }
+
+          await pc.setRemoteDescription(description);
+          if (description.type === 'offer') {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            send({ type: 'signal', data: { description: pc.localDescription } });
+            log('Answer sent.');
+          }
+          return;
+        }
+
+        if (candidate) {
+          try {
+            await pc.addIceCandidate(candidate);
+          } catch (err) {
+            log(`ICE error: ${err.message}`);
+          }
+        }
+        return;
+      }
+
+      if (message.type === 'error') {
+        log(`Server error: ${message.message}`);
+      }
+    };
+
+    joinBtn.addEventListener('click', () => {
+      const roomId = roomIdEl.value.trim();
+      if (!roomId) {
+        log('Room ID cannot be empty.');
+        return;
+      }
+      send({ type: 'join', roomId });
+    });
+
+    startBtn.addEventListener('click', () => {
+      startCall().catch((err) => log(`Start call failed: ${err.message}`));
+    });
+  </script>
+</body>
+</html>
