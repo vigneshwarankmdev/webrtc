@@ -194,26 +194,48 @@
     async function ensurePeerConnection() {
       if (pc) return;
 
-      // Use Google's public STUN server to discover the public IP/port
+      // Use STUN + free TURN server for NAT traversal
+      // STUN: finds public IP. TURN: relays media if direct connection fails
       pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          {
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject',
+          },
+          {
+            urls: 'turn:openrelay.metered.ca:443',
+            username: 'openrelayproject',
+            credential: 'openrelayproject',
+          },
+        ],
       });
 
-      // Forward each ICE candidate to the remote peer via the signaling server
+      // Log all ICE candidates discovered
       pc.onicecandidate = (event) => {
         if (event.candidate) {
+          log(`ICE candidate: ${event.candidate.candidate.split(' ')[4]} (${event.candidate.type})`);
           send({ type: 'signal', data: { candidate: event.candidate } });
+        } else {
+          log('ICE gathering complete.');
         }
       };
 
       // Attach the remote media stream to the remote <video> element
       pc.ontrack = (event) => {
+        log(`Remote track received: ${event.track.kind}`);
         remoteVideo.srcObject = event.streams[0];
       };
 
       // Log connection state changes (connecting, connected, disconnected, etc.)
       pc.onconnectionstatechange = () => {
         log(`Connection state: ${pc.connectionState}`);
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE connection state: ${pc.iceConnectionState}`);
       };
 
       await ensureMedia();
