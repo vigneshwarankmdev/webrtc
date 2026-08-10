@@ -1,4 +1,21 @@
 <!doctype html>
+<!--
+  index.html — WebRTC Demo Client
+
+  How it works:
+  1. On load, a WebSocket connection is opened to the signaling server.
+  2. The user enters a Room ID and clicks "Join Room" — a 'join' message
+     is sent over WebSocket so the server groups two peers together.
+  3. The first peer clicks "Start Call":
+       a. getUserMedia() captures the local camera/microphone.
+       b. An RTCPeerConnection is created with a public STUN server.
+       c. An SDP offer is created and forwarded to the other peer via
+          the signaling server (type: 'signal').
+  4. The second peer receives the offer, creates an answer, and sends it back.
+  5. Both peers exchange ICE candidates through the signaling server.
+  6. Once ICE negotiation succeeds, media streams flow directly between
+     the two browsers — the signaling server is no longer involved.
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -124,6 +141,7 @@
   </main>
 
   <script>
+    // --- DOM references ---
     const logEl = document.getElementById('log');
     const roomIdEl = document.getElementById('roomId');
     const localVideo = document.getElementById('localVideo');
@@ -131,58 +149,84 @@
     const joinBtn = document.getElementById('joinBtn');
     const startBtn = document.getElementById('startBtn');
 
+    // Open WebSocket to the signaling server (same host, wss on HTTPS)
     const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${wsProtocol}//${location.host}`);
 
-    let pc;
-    let localStream;
-    let joined = false;
-    let makingOffer = false;
+    let pc;           // RTCPeerConnection instance
+    let localStream;  // MediaStream from getUserMedia
+    let joined = false;      // True once the server confirms room entry
+    let makingOffer = false; // Guards against simultaneous offer creation
 
+    /** Append a timestamped message to the on-screen log. */
     function log(msg) {
       const time = new Date().toLocaleTimeString();
       logEl.textContent += `[${time}] ${msg}\n`;
       logEl.scrollTop = logEl.scrollHeight;
     }
 
+    /** Send a JSON message to the signaling server over WebSocket. */
     function send(payload) {
       ws.send(JSON.stringify(payload));
     }
 
+    /**
+     * Request camera + microphone access and attach the stream to
+     * the local <video> element. Only runs once per page load.
+     */
     async function ensureMedia() {
       if (!localStream) {
+        // Check if mediaDevices is available (requires HTTPS or localhost)
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('Camera/microphone access not available. Ensure you are using HTTPS or localhost.');
+        }
         localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
         localVideo.srcObject = localStream;
       }
     }
 
+    /**
+     * Create the RTCPeerConnection (if not already created) and wire up
+     * its event handlers. Also calls ensureMedia() so local tracks are
+     * added before any offer/answer is negotiated.
+     */
     async function ensurePeerConnection() {
       if (pc) return;
 
+      // Use Google's public STUN server to discover the public IP/port
       pc = new RTCPeerConnection({
         iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
       });
 
+      // Forward each ICE candidate to the remote peer via the signaling server
       pc.onicecandidate = (event) => {
         if (event.candidate) {
           send({ type: 'signal', data: { candidate: event.candidate } });
         }
       };
 
+      // Attach the remote media stream to the remote <video> element
       pc.ontrack = (event) => {
         remoteVideo.srcObject = event.streams[0];
       };
 
+      // Log connection state changes (connecting, connected, disconnected, etc.)
       pc.onconnectionstatechange = () => {
         log(`Connection state: ${pc.connectionState}`);
       };
 
       await ensureMedia();
+      // Add local audio/video tracks so they are included in the SDP offer
       for (const track of localStream.getTracks()) {
         pc.addTrack(track, localStream);
       }
     }
 
+    /**
+     * Initiates a call by creating an SDP offer and sending it to the
+     * remote peer through the signaling server.
+     * Only the peer that clicks "Start Call" sends the offer.
+     */
     async function startCall() {
       if (!joined) {
         log('Join a room first.');
@@ -192,7 +236,7 @@
       await ensurePeerConnection();
       makingOffer = true;
       const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      await pc.setLocalDescription(offer); // Triggers ICE candidate gathering
       send({ type: 'signal', data: { description: pc.localDescription } });
       makingOffer = false;
       log('Offer sent.');
@@ -200,31 +244,39 @@
 
     ws.onopen = () => log('Connected to signaling server.');
 
+    // Handle all incoming messages from the signaling server
     ws.onmessage = async (event) => {
       const message = JSON.parse(event.data);
 
+      // Server confirmed room entry
       if (message.type === 'joined') {
         joined = true;
         log(`Joined room: ${message.roomId} (peers: ${message.peerCount})`);
         return;
       }
 
+      // The other browser tab has joined the same room
       if (message.type === 'peer-joined') {
         log('Peer joined room.');
         return;
       }
 
+      // The other peer disconnected — clear the remote video
       if (message.type === 'peer-left') {
         log('Peer left room.');
         remoteVideo.srcObject = null;
         return;
       }
 
+      // Signaling message: either an SDP description or an ICE candidate
       if (message.type === 'signal') {
         const { description, candidate } = message.data || {};
         await ensurePeerConnection();
 
         if (description) {
+          // Offer collision: both peers tried to send an offer simultaneously.
+          // The 'polite' peer (always true here) rolls back and accepts the
+          // incoming offer; the 'impolite' peer would ignore it.
           const offerCollision = description.type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
           const polite = true;
           if (offerCollision && !polite) {
@@ -232,6 +284,7 @@
           }
 
           await pc.setRemoteDescription(description);
+          // If the incoming description is an offer, create and send an answer
           if (description.type === 'offer') {
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
@@ -241,6 +294,7 @@
           return;
         }
 
+        // Add the received ICE candidate to the peer connection
         if (candidate) {
           try {
             await pc.addIceCandidate(candidate);
@@ -256,6 +310,7 @@
       }
     };
 
+    // Send a 'join' message to the server with the chosen room ID
     joinBtn.addEventListener('click', () => {
       const roomId = roomIdEl.value.trim();
       if (!roomId) {
@@ -265,6 +320,7 @@
       send({ type: 'join', roomId });
     });
 
+    // Kick off the call from this peer (creates and sends the SDP offer)
     startBtn.addEventListener('click', () => {
       startCall().catch((err) => log(`Start call failed: ${err.message}`));
     });
